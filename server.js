@@ -2,7 +2,7 @@
 
 const express = require('express');
 const db      = require('../config/db');
-const { safeSend } = require('../bot/core');
+const { safeSend } = require('./bot/core');
 require('dotenv').config();
 
 const app = express();
