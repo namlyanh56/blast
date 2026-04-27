@@ -322,29 +322,42 @@ async function handleClientMessage(msg, user) {
       const sessionId = sessRes.rows[0].id;
       clearState(tid);
 
-      const waitMsg = await safeSend(chatId, `⏳ Menghubungkan ke WhatsApp...\nMohon tunggu 5-10 detik.`);
+      const waitMsg = await safeSend(chatId,
+        `⏳ *Menghubungkan ke WhatsApp...*\n\n` +
+        `Sedang meminta kode pairing untuk nomor \`${phone}\`\n` +
+        `Mohon tunggu 10-20 detik...`
+      );
 
+      // connectSession will fire pairingCb when QR phase is active (real code)
       await wa.connectSession(sessionId, phone, async (code, err) => {
         await safeDelete(chatId, waitMsg.message_id);
+
         if (err || !code) {
-          await safeSend(chatId, `❌ Gagal mendapatkan kode pairing: ${err || 'Unknown error'}`);
-          // Cleanup DB
+          // Cleanup DB record on failure
           await db.query("DELETE FROM wa_sessions WHERE id=$1", [sessionId]);
-          return;
+          return safeSend(chatId,
+            `❌ *Gagal mendapatkan kode pairing*\n\n` +
+            `Alasan: \`${err || 'Unknown error'}\`\n\n` +
+            `💡 *Tips:*\n` +
+            `• Pastikan nomor HP aktif & terdaftar di WhatsApp\n` +
+            `• Format: \`628xxx\` atau \`08xxx\`\n` +
+            `• Coba lagi setelah 30 detik`,
+            { reply_markup: mainMenuKbd() }
+          );
         }
 
-        // Format code: XXXX-XXXX
-        const formatted = code.length === 8 ? `${code.slice(0,4)}-${code.slice(4)}` : code;
+        // code already formatted as XXXX-XXXX by whatsapp.js
         await safeSend(chatId,
-          `✅ *Kode Pairing Berhasil Didapat!*\n\n` +
-          `🔑 *${formatted}*\n\n` +
-          `📱 *Cara Memasukkan Kode:*\n` +
-          `1. Buka WhatsApp di HP Anda\n` +
+          `✅ *Kode Pairing Berhasil!*\n\n` +
+          `🔑 \`${code}\`\n\n` +
+          `📱 *Cara memasukkan kode:*\n` +
+          `1. Buka WhatsApp di HP\n` +
           `2. Ketuk ⋮ → *Perangkat Tertaut*\n` +
           `3. Ketuk *Tautkan Perangkat*\n` +
           `4. Pilih *Tautkan dengan nomor telepon*\n` +
           `5. Masukkan kode di atas\n\n` +
-          `⏰ Kode berlaku selama *60 detik*`,
+          `⏰ Kode berlaku *60 detik*\n` +
+          `_Setelah berhasil, akun otomatis muncul di Daftar Bot._`,
           { reply_markup: mainMenuKbd() }
         );
       });
