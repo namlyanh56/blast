@@ -61,6 +61,15 @@ async function connectSession(sessionId, phoneNumber = null, pairingCb = null) {
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
   const { version } = await fetchLatestBaileysVersion();
 
+  // Normalize phone: strip non-digits, ensure starts with country code
+  const cleanPhone = phoneNumber
+    ? String(phoneNumber).replace(/\D/g, '').replace(/^0/, '62')
+    : null;
+
+  // Pairing code mode: must tell Baileys upfront via `mobile: true`
+  // and provide the phone number so it skips QR generation
+  const usePairing = !!(cleanPhone && pairingCb && !state.creds.registered);
+
   const sock = makeWASocket({
     version,
     logger,
@@ -70,24 +79,41 @@ async function connectSession(sessionId, phoneNumber = null, pairingCb = null) {
     },
     printQRInTerminal: false,
     generateHighQualityLinkPreview: false,
-    defaultQueryTimeoutMs: 30000,
+    defaultQueryTimeoutMs: 60000,
     syncFullHistory: false,
     markOnlineOnConnect: false,
     browser: ['WA-Blast', 'Chrome', '120.0.0'],
+    // Disable QR so Baileys enters pairing-code mode automatically
+    ...(usePairing ? { mobile: false } : {}),
   });
 
   sessions.set(sessionId, sock);
 
   // ── Pairing Code ────────────────────────────────────────────────────────────
-  if (phoneNumber && !state.creds.registered && pairingCb) {
-    try {
-      await sleep(2500);
-      const rawPhone = String(phoneNumber).replace(/\D/g, '');
-      const code = await sock.requestPairingCode(rawPhone);
-      pairingCb(code, null);
-    } catch (err) {
-      pairingCb(null, err.message);
-    }
+  // Request the code ONLY after Baileys fires the `qr` event,
+  // which means the WS handshake is done and the server is waiting.
+  // Requesting before this point yields a garbage/fake code.
+  let pairingRequested = false;
+
+  if (usePairing) {
+    sock.ev.on('connection.update', async (update) => {
+      // `qr` field being present means socket is in auth-waiting state
+      if (update.qr && !pairingRequested) {
+        pairingRequested = true;
+        try {
+          const code = await sock.requestPairingCode(cleanPhone);
+          // Baileys returns 8-char string; format as XXXX-XXXX for readability
+          const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
+          pairingCb(formatted, null);
+        } catch (err) {
+          pairingCb(null, err.message);
+          // Clean up failed session
+          sessions.delete(sessionId);
+          await db.query("UPDATE wa_sessions SET status='disconnected' WHERE id=$1", [sessionId]);
+          _cleanSessionFiles(sessionId);
+        }
+      }
+    });
   }
 
   // ── Connection Events ────────────────────────────────────────────────────────
