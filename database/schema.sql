@@ -39,12 +39,14 @@ CREATE TABLE IF NOT EXISTS settings (
 
 -- ============================================================
 -- BLAST TARGETS
+-- target status: pending → sending → sent / failed
+-- 'sending' adalah status sementara saat diproses (atomic lock)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS targets (
   id              SERIAL PRIMARY KEY,
   phone_number    VARCHAR(25) UNIQUE NOT NULL,
   status          VARCHAR(10) DEFAULT 'pending'
-                  CHECK (status IN ('pending','sent','failed')),
+                  CHECK (status IN ('pending','sending','sent','failed')),
   sent_at         TIMESTAMP,
   sent_by_session INTEGER REFERENCES wa_sessions(id) ON DELETE SET NULL,
   created_at      TIMESTAMP DEFAULT NOW()
@@ -95,6 +97,8 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 
 -- ============================================================
 -- DEFAULT SETTINGS
+-- FIX 3: Tambah profile_name & profile_pic sebagai setting
+--         universal admin yang persisten dan bisa diubah kapan saja.
 -- ============================================================
 INSERT INTO settings (key, value) VALUES
   ('message_text',       'Halo! Ini adalah pesan promosi dari kami. Terima kasih.'),
@@ -102,7 +106,9 @@ INSERT INTO settings (key, value) VALUES
   ('button_name',        'Kunjungi Kami'),
   ('button_url',         'https://example.com'),
   ('price_per_message',  '100'),
-  ('min_withdraw',       '10000')
+  ('min_withdraw',       '10000'),
+  ('profile_name',       ''),
+  ('profile_pic',        '')
 ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================
@@ -115,9 +121,3 @@ CREATE INDEX IF NOT EXISTS idx_send_logs_user      ON send_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_wa_sessions_user    ON wa_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_wa_sessions_status  ON wa_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user    ON withdrawals(user_id);
-
--- FIX 3: Universal profile settings (one-time admin config, auto-applied to all sessions)
-INSERT INTO settings (key, value) VALUES
-  ('profile_name', ''),
-  ('profile_pic',  '')
-ON CONFLICT (key) DO NOTHING;
