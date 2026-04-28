@@ -18,14 +18,9 @@ const { htmlToWa, normalizePhone, sleep, randomDelay } = require('../utils/helpe
 require('dotenv').config();
 
 // ─── In-memory stores ────────────────────────────────────────────────────────
-/** Map<sessionId (number), WASocket> */
-const sessions = new Map();
-
-/** Map<sessionId, { running: bool, abort: bool, sentCount, failCount }> */
-const blastJobs = new Map();
-
-/** Callback registry for blast events: Map<sessionId, Function> */
-const blastCallbacks = new Map();
+const sessions      = new Map(); // Map<sessionId, WASocket>
+const blastJobs     = new Map(); // Map<sessionId, { running, abort, sentCount, failCount }>
+const blastCallbacks = new Map(); // Map<sessionId, Function>
 
 const SESSION_DIR = process.env.SESSION_DIR || './sessions';
 if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
@@ -42,15 +37,52 @@ function notify(sessionId, data) {
   if (cb) cb(data);
 }
 
+// ─── Apply saved profile settings to a connected socket ──────────────────────
+// FIX 3: Dipanggil setiap kali sesi baru berhasil connect, agar setting
+// profile_name & profile_pic dari admin langsung diterapkan secara otomatis.
+async function _applyProfileSettings(sessionId, sock) {
+  try {
+    const res = await db.query(
+      "SELECT key, value FROM settings WHERE key IN ('profile_name','profile_pic')"
+    );
+    const st = {};
+    for (const r of res.rows) st[r.key] = r.value;
+
+    if (st.profile_name?.trim()) {
+      try {
+        await sock.updateProfileName(st.profile_name.trim());
+      } catch (e) {
+        console.error(`[Session ${sessionId}] apply profile_name error:`, e.message);
+      }
+    }
+
+    if (st.profile_pic?.trim()) {
+      try {
+        const imgRes = await axios.get(st.profile_pic.trim(), { responseType: 'arraybuffer', timeout: 10000 });
+        await sock.updateProfilePicture(sock.user.id, Buffer.from(imgRes.data));
+      } catch (e) {
+        console.error(`[Session ${sessionId}] apply profile_pic error:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error(`[Session ${sessionId}] _applyProfileSettings error:`, e.message);
+  }
+}
+
 // ─── Connect Session ─────────────────────────────────────────────────────────
 /**
  * Connect / reconnect a WhatsApp session.
- * @param {number}   sessionId      - DB row ID in wa_sessions
+ *
+ * FIX 2: Pairing code kini direquest di dalam event `connection.update`
+ * saat Baileys benar-benar siap (creds.registered === false + koneksi open/QR),
+ * menggunakan setTimeout 3 detik agar socket stabil sebelum requestPairingCode.
+ * Ini mencegah kode palsu/garbage yang terjadi ketika kode diminta terlalu dini.
+ *
+ * @param {number}   sessionId
  * @param {string}   [phoneNumber]  - Required for pairing code flow
- * @param {Function} [pairingCb]    - Called with (code) or (null, errMsg)
+ * @param {Function} [pairingCb]    - Called with (code, null) or (null, errMsg)
  */
 async function connectSession(sessionId, phoneNumber = null, pairingCb = null) {
-  // Avoid duplicate connections
   if (sessions.has(sessionId)) return;
 
   await db.query("UPDATE wa_sessions SET status='connecting' WHERE id=$1", [sessionId]);
@@ -59,15 +91,13 @@ async function connectSession(sessionId, phoneNumber = null, pairingCb = null) {
   if (!fs.existsSync(authPath)) fs.mkdirSync(authPath, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
-  const { version } = await fetchLatestBaileysVersion();
+  const { version }          = await fetchLatestBaileysVersion();
 
-  // Normalize phone: strip non-digits, ensure starts with country code
   const cleanPhone = phoneNumber
     ? String(phoneNumber).replace(/\D/g, '').replace(/^0/, '62')
     : null;
 
-  // Pairing code mode: must tell Baileys upfront via `mobile: true`
-  // and provide the phone number so it skips QR generation
+  // Pairing mode: nomor ada, callback ada, belum registered
   const usePairing = !!(cleanPhone && pairingCb && !state.creds.registered);
 
   const sock = makeWASocket({
@@ -83,40 +113,50 @@ async function connectSession(sessionId, phoneNumber = null, pairingCb = null) {
     syncFullHistory: false,
     markOnlineOnConnect: false,
     browser: ['WA-Blast', 'Chrome', '120.0.0'],
-    // Disable QR so Baileys enters pairing-code mode automatically
-    ...(usePairing ? { mobile: false } : {}),
   });
 
   sessions.set(sessionId, sock);
 
-  // ── Pairing Code ────────────────────────────────────────────────────────────
-  // Request the code ONLY after Baileys fires the `qr` event,
-  // which means the WS handshake is done and the server is waiting.
-  // Requesting before this point yields a garbage/fake code.
+  // ── FIX 2: Request pairing code dengan timing yang benar ──────────────────
+  // Baileys harus dalam kondisi "registered === false" dan socket sudah
+  // menyelesaikan handshake WS. Kita tunggu event connection.update pertama,
+  // lalu delay 3 detik sebelum requestPairingCode agar tidak menghasilkan kode palsu.
   let pairingRequested = false;
 
   if (usePairing) {
     sock.ev.on('connection.update', async (update) => {
-      // `qr` field being present means socket is in auth-waiting state
-      if (update.qr && !pairingRequested) {
-        pairingRequested = true;
+      // Hanya proses satu kali
+      if (pairingRequested) return;
+
+      const { connection, qr } = update;
+
+      // Baileys mengirim event qr ATAU connection='open' di fase awal.
+      // Kita request pairing code setelah salah satu terjadi.
+      const isReady = qr || connection === 'open';
+      if (!isReady) return;
+
+      pairingRequested = true;
+
+      // Delay 3 detik — member socket stabil (sesuai contoh referensi)
+      setTimeout(async () => {
         try {
-          const code = await sock.requestPairingCode(cleanPhone);
-          // Baileys returns 8-char string; format as XXXX-XXXX for readability
+          const code      = await sock.requestPairingCode(cleanPhone);
+          // Format XXXX-XXXX agar mudah dibaca
           const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
           pairingCb(formatted, null);
         } catch (err) {
+          console.error(`[Session ${sessionId}] requestPairingCode error:`, err.message);
           pairingCb(null, err.message);
-          // Clean up failed session
+          // Bersihkan sesi gagal
           sessions.delete(sessionId);
           await db.query("UPDATE wa_sessions SET status='disconnected' WHERE id=$1", [sessionId]);
           _cleanSessionFiles(sessionId);
         }
-      }
+      }, 3000);
     });
   }
 
-  // ── Connection Events ────────────────────────────────────────────────────────
+  // ── Connection Events ─────────────────────────────────────────────────────
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update;
 
@@ -127,6 +167,9 @@ async function connectSession(sessionId, phoneNumber = null, pairingCb = null) {
         [phone, sessionId]
       );
       console.log(`✅ [Session ${sessionId}] Connected: ${phone}`);
+
+      // FIX 3: Terapkan profile settings yang sudah diset admin
+      await _applyProfileSettings(sessionId, sock);
     }
 
     if (connection === 'close') {
@@ -136,21 +179,18 @@ async function connectSession(sessionId, phoneNumber = null, pairingCb = null) {
       console.log(`⚠️  [Session ${sessionId}] Closed. Code: ${statusCode}`);
 
       if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-        // Logged out — cleanup
         await db.query("UPDATE wa_sessions SET status='disconnected' WHERE id=$1", [sessionId]);
         _cleanSessionFiles(sessionId);
         notify(sessionId, { type: 'logout', sessionId });
       } else if (statusCode === 403) {
-        // Banned
         await db.query("UPDATE wa_sessions SET status='banned' WHERE id=$1", [sessionId]);
         _stopBlastInternal(sessionId, 'banned');
         notify(sessionId, { type: 'banned', sessionId });
       } else {
-        // Reconnectable
         await db.query("UPDATE wa_sessions SET status='disconnected' WHERE id=$1", [sessionId]);
         _stopBlastInternal(sessionId, 'disconnected');
         notify(sessionId, { type: 'disconnected', sessionId });
-        // Auto-reconnect after 8s
+        // Auto-reconnect setelah 8 detik
         setTimeout(() => connectSession(sessionId), 8000);
       }
     }
@@ -159,11 +199,7 @@ async function connectSession(sessionId, phoneNumber = null, pairingCb = null) {
   sock.ev.on('creds.update', saveCreds);
 }
 
-// ─── Send Message (with button fallback) ─────────────────────────────────────
-/**
- * Send WA message with button. Falls back to plain text + URL if buttons unsupported.
- * @returns {boolean} true = sent successfully
- */
+// ─── Send Message ─────────────────────────────────────────────────────────────
 async function sendMessage(sessionId, phoneJid, { text, imageUrl, buttonName, buttonUrl }) {
   const sock = sessions.get(sessionId);
   if (!sock) return false;
@@ -172,7 +208,6 @@ async function sendMessage(sessionId, phoneJid, { text, imageUrl, buttonName, bu
     let result = null;
 
     if (imageUrl && imageUrl.trim()) {
-      // ── Image + caption + button ──────────────────────────────────────────
       try {
         result = await sock.sendMessage(phoneJid, {
           image:      { url: imageUrl },
@@ -182,14 +217,12 @@ async function sendMessage(sessionId, phoneJid, { text, imageUrl, buttonName, bu
           headerType: 4,
         });
       } catch {
-        // Fallback: image with caption + URL text
         result = await sock.sendMessage(phoneJid, {
           image:   { url: imageUrl },
           caption: `${text}\n\n🔗 *${buttonName}*\n${buttonUrl}`,
         });
       }
     } else {
-      // ── Text + button ─────────────────────────────────────────────────────
       try {
         result = await sock.sendMessage(phoneJid, {
           text:    text,
@@ -197,14 +230,12 @@ async function sendMessage(sessionId, phoneJid, { text, imageUrl, buttonName, bu
           footer:  buttonUrl,
         });
       } catch {
-        // Fallback: plain text with URL
         result = await sock.sendMessage(phoneJid, {
           text: `${text}\n\n🔗 *${buttonName}*: ${buttonUrl}`,
         });
       }
     }
 
-    // sendMessage returning a result object means it was accepted by WA servers
     return !!result;
   } catch (err) {
     console.error(`❌ Send error → ${phoneJid}: ${err.message}`);
@@ -212,12 +243,7 @@ async function sendMessage(sessionId, phoneJid, { text, imageUrl, buttonName, bu
   }
 }
 
-// ─── Start Blast ─────────────────────────────────────────────────────────────
-/**
- * Start the blast job for a session.
- * @param {number}   sessionId
- * @param {Function} eventCallback  - called with event objects during blast
- */
+// ─── Start Blast ──────────────────────────────────────────────────────────────
 async function startBlast(sessionId, eventCallback) {
   if (blastJobs.get(sessionId)?.running) {
     return { success: false, message: 'Blast sudah berjalan untuk akun ini.' };
@@ -226,7 +252,6 @@ async function startBlast(sessionId, eventCallback) {
   const sock = sessions.get(sessionId);
   if (!sock) return { success: false, message: 'Akun tidak terhubung ke WhatsApp.' };
 
-  // Fetch session + owner info
   const sessRes = await db.query(
     `SELECT s.*, u.id as uid FROM wa_sessions s
      JOIN users u ON s.user_id = u.id WHERE s.id=$1`,
@@ -235,28 +260,25 @@ async function startBlast(sessionId, eventCallback) {
   if (!sessRes.rows.length) return { success: false, message: 'Sesi tidak ditemukan.' };
   const sess = sessRes.rows[0];
 
-  // Fetch settings
   const stRes = await db.query('SELECT key, value FROM settings');
-  const st = {};
+  const st    = {};
   for (const r of stRes.rows) st[r.key] = r.value;
 
-  const price       = parseFloat(st.price_per_message || '100');
-  const msgText     = htmlToWa(st.message_text || '');
-  const imageUrl    = st.message_image  || '';
-  const buttonName  = st.button_name   || 'Kunjungi';
-  const buttonUrl   = st.button_url    || 'https://example.com';
-  const delay       = sess.delay_ms    || 3000;
+  const price      = parseFloat(st.price_per_message || '100');
+  const msgText    = htmlToWa(st.message_text || '');
+  const imageUrl   = st.message_image  || '';
+  const buttonName = st.button_name    || 'Kunjungi';
+  const buttonUrl  = st.button_url     || 'https://example.com';
+  const delay      = sess.delay_ms     || 3000;
 
   const job = { running: true, abort: false, sentCount: 0, failCount: 0 };
   blastJobs.set(sessionId, job);
   blastCallbacks.set(sessionId, eventCallback);
 
-  // ── Blast Loop ──────────────────────────────────────────────────────────────
   const runLoop = async () => {
     let lastPhone = '';
 
     while (!job.abort) {
-      // Check session status in DB
       const statusRow = await db.query('SELECT status FROM wa_sessions WHERE id=$1', [sessionId]);
       const curStatus = statusRow.rows[0]?.status;
       if (curStatus !== 'connected') {
@@ -270,48 +292,37 @@ async function startBlast(sessionId, eventCallback) {
         break;
       }
 
-      // Grab next pending target (atomic via UPDATE ... RETURNING)
       const targetRes = await db.query(
         `UPDATE targets SET status='sent'
          WHERE id = (
            SELECT id FROM targets WHERE status='pending'
-           ORDER BY id ASC
-           LIMIT 1
-           FOR UPDATE SKIP LOCKED
+           ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
          )
          RETURNING id, phone_number`
       );
 
       if (!targetRes.rows.length) {
-        // No more targets
         eventCallback({ type: 'done', sentCount: job.sentCount, failCount: job.failCount });
         break;
       }
 
-      const target     = targetRes.rows[0];
-      const phoneJid   = normalizePhone(target.phone_number);
-      lastPhone        = target.phone_number;
+      const target   = targetRes.rows[0];
+      const phoneJid = normalizePhone(target.phone_number);
+      lastPhone      = target.phone_number;
 
       const ok = await sendMessage(sessionId, phoneJid, { text: msgText, imageUrl, buttonName, buttonUrl });
 
       if (ok) {
-        // Confirm sent
-        await db.query(
-          "UPDATE targets SET sent_at=NOW(), sent_by_session=$1 WHERE id=$2",
-          [sessionId, target.id]
-        );
-        // Log + credit user balance
+        await db.query("UPDATE targets SET sent_at=NOW(), sent_by_session=$1 WHERE id=$2", [sessionId, target.id]);
         await db.query(
           'INSERT INTO send_logs (session_id, user_id, phone_number, status, cost) VALUES ($1,$2,$3,$4,$5)',
           [sessionId, sess.uid, target.phone_number, 'sent', price]
         );
         await db.query('UPDATE users SET balance = balance + $1 WHERE id=$2', [price, sess.uid]);
         await db.query('UPDATE wa_sessions SET last_msg_index = last_msg_index + 1 WHERE id=$1', [sessionId]);
-
         job.sentCount++;
         eventCallback({ type: 'progress', phone: target.phone_number, sentCount: job.sentCount, failCount: job.failCount });
       } else {
-        // Revert target to pending
         await db.query("UPDATE targets SET status='pending', sent_at=NULL WHERE id=$1", [target.id]);
         await db.query(
           'INSERT INTO send_logs (session_id, user_id, phone_number, status, cost) VALUES ($1,$2,$3,$4,$5)',
@@ -320,9 +331,7 @@ async function startBlast(sessionId, eventCallback) {
         job.failCount++;
       }
 
-      if (!job.abort) {
-        await sleep(randomDelay(delay));
-      }
+      if (!job.abort) await sleep(randomDelay(delay));
     }
 
     job.running = false;
@@ -341,10 +350,7 @@ async function startBlast(sessionId, eventCallback) {
 // ─── Stop Blast ───────────────────────────────────────────────────────────────
 function stopBlast(sessionId) {
   const job = blastJobs.get(sessionId);
-  if (job) {
-    job.abort   = true;
-    job.running = false;
-  }
+  if (job) { job.abort = true; job.running = false; }
 }
 
 function _stopBlastInternal(sessionId, reason) {
@@ -367,7 +373,7 @@ function _cleanSessionFiles(sessionId) {
   try { if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); } catch (_) {}
 }
 
-// ─── Update Profile for All Connected Sessions ───────────────────────────────
+// ─── Update Profile for All Connected Sessions ────────────────────────────────
 async function updateAllProfilePic(imageUrl) {
   const res = await db.query("SELECT id FROM wa_sessions WHERE status='connected'");
   let count = 0;
