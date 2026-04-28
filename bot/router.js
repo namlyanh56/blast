@@ -4,7 +4,7 @@ const { bot, ADMIN_ID, getOrRegisterUser, safeSend, clearState } = require('./co
 const admin  = require('./admin');
 const client = require('./client');
 
-// ─── /start command ──────────────────────────────────────────────────────────
+// ─── /start command ───────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   try {
     const user = await getOrRegisterUser(msg.from);
@@ -18,7 +18,7 @@ bot.onText(/\/start/, async (msg) => {
   }
 });
 
-// ─── /menu command ───────────────────────────────────────────────────────────
+// ─── /menu command ────────────────────────────────────────────────────────────
 bot.onText(/\/menu/, async (msg) => {
   try {
     const user = await getOrRegisterUser(msg.from);
@@ -32,7 +32,7 @@ bot.onText(/\/menu/, async (msg) => {
   }
 });
 
-// ─── /cancel command ─────────────────────────────────────────────────────────
+// ─── /cancel command ──────────────────────────────────────────────────────────
 bot.onText(/\/cancel/, async (msg) => {
   const user = await getOrRegisterUser(msg.from);
   clearState(msg.from.id);
@@ -60,18 +60,24 @@ bot.onText(/\/status/, async (msg) => {
 
   await safeSend(msg.chat.id,
     `📊 *System Status*\n\n` +
-    `📱 WA Connected : *${conns.rows[0].cnt}*\n` +
-    `🔥 Active Blasts: *${runningBlasts}*\n` +
+    `📱 WA Connected   : *${conns.rows[0].cnt}*\n` +
+    `🔥 Active Blasts  : *${runningBlasts}*\n` +
     `🎯 Pending Targets: *${pending.rows[0].cnt}*\n` +
-    `👥 Total Clients: *${users.rows[0].cnt}*\n\n` +
+    `👥 Total Clients  : *${users.rows[0].cnt}*\n\n` +
     `⏰ ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`
   );
 });
 
-// ─── All messages ─────────────────────────────────────────────────────────────
+// ─── All messages (text + photo + document) ───────────────────────────────────
+// FIX 1: Listener sekarang juga menangkap pesan foto (msg.photo) agar bisa
+// diteruskan ke handleAdminMessage/handleClientMessage tanpa URL.
 bot.on('message', async (msg) => {
-  // Skip commands (handled above)
+  // Skip commands
   if (msg.text?.startsWith('/')) return;
+
+  // Hanya proses: pesan teks, foto, atau dokumen
+  const hasContent = msg.text || msg.photo || msg.document;
+  if (!hasContent) return;
 
   try {
     const user = await getOrRegisterUser(msg.from);
@@ -94,7 +100,6 @@ bot.on('callback_query', async (query) => {
     const data = query.data;
 
     if (data === 'c:main' && user.role === 'admin') {
-      // Refresh user data (balance may have changed)
       return await admin.showMainMenu(query.message.chat.id);
     }
 
@@ -103,17 +108,14 @@ bot.on('callback_query', async (query) => {
     }
 
     if (user.role === 'admin') {
-      // Admin handles both a: and some c: for viewing
       if (data.startsWith('a:')) {
         await admin.handleAdminCallback(query, user);
       } else {
-        // Admin can also use /start-like client callbacks if needed
         await safeSend(query.message.chat.id, '⚠️ Gunakan /menu untuk kembali ke menu admin.');
       }
     } else {
       if (data.startsWith('c:')) {
-        // Re-fetch user to get latest balance
-        const db   = require('../config/db');
+        const db    = require('../config/db');
         const fresh = await db.query('SELECT * FROM users WHERE telegram_id=$1', [query.from.id]);
         await client.handleClientCallback(query, fresh.rows[0] || user);
       } else {
