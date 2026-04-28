@@ -115,3 +115,9 @@ CREATE INDEX IF NOT EXISTS idx_send_logs_user      ON send_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_wa_sessions_user    ON wa_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_wa_sessions_status  ON wa_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user    ON withdrawals(user_id);
+
+-- FIX 3: Universal profile settings (one-time admin config, auto-applied to all sessions)
+INSERT INTO settings (key, value) VALUES
+  ('profile_name', ''),
+  ('profile_pic',  '')
+ON CONFLICT (key) DO NOTHING;
